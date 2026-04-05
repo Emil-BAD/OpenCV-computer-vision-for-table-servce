@@ -6,17 +6,22 @@ from ultralytics import YOLO
 parser = argparse.ArgumentParser()
 parser.add_argument("--video", default="video/video2.mp4")
 parser.add_argument("--model", default="yolov8n.pt")
+parser.add_argument("--output", default="output.mp4")
+parser.add_argument("--show", action="store_true")
 args = parser.parse_args()
 
 video_path = args.video
 model_path = args.model
-conf_threshold = 0.25 #порог уверенности детекции
-padding = 80 #расширение зоны стола, чтобы учитывать людей, стоящих рядом с ним
-person_class_id = 0 #класс "человек" в модели YOLOv8 имеет id 0
-free_confirmation_sec = 4.0 #количество секунд, в течение которых человек должен отсутствовать, чтобы считать стол свободным
+output_path = args.output
+show_preview = args.show
+conf_threshold = 0.25  # порог уверенности детекции
+padding = 80  # расширение зоны стола, чтобы учитывать людей, стоящих рядом с ним
+person_class_id = 0  # класс "человек" в модели YOLOv8 имеет id 0
+free_confirmation_sec = 4.0  # количество секунд, в течение которых человек должен отсутствовать, чтобы считать стол свободным
+progress_step = 100
 
 
-def clamp_box(box, width, height): #ограничение координат рамки, чтобы она не выходила за пределы кадра
+def clamp_box(box, width, height):  # ограничение координат рамки, чтобы она не выходила за пределы кадра
     x1, y1, x2, y2 = box
     return (
         max(0, min(int(x1), width - 1)),
@@ -26,7 +31,7 @@ def clamp_box(box, width, height): #ограничение координат р
     )
 
 
-def intersects(box_a, box_b): #проверка пересечения двух рамок (человека и зоны стола)
+def intersects(box_a, box_b):  # проверка пересечения двух рамок
     return not (
         box_a[2] < box_b[0]
         or box_a[0] > box_b[2]
@@ -40,6 +45,10 @@ if not cap.isOpened():
     raise RuntimeError(f"failed to open video: {video_path}")
 
 fps = cap.get(cv2.CAP_PROP_FPS)
+if fps <= 0:
+    fps = 25.0
+
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 frame_index = 0
 
 ok, first_frame = cap.read()
@@ -56,7 +65,7 @@ cv2.destroyWindow("select table")
 if roi[2] == 0 or roi[3] == 0:
     raise RuntimeError("roi was not selected. draw the table area and press enter or space.")
 
-#расширение зоны стола на заданное количество пикселей
+# расширение зоны стола на заданное количество пикселей
 table_box = clamp_box(
     (
         roi[0] - padding,
@@ -68,7 +77,13 @@ table_box = clamp_box(
     frame_h,
 )
 
-#загрузка модели YOLOv8 для детекции людей
+# создаем файл результата в mp4
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_w, frame_h))
+if not writer.isOpened():
+    raise RuntimeError(f"failed to create output video: {output_path}")
+
+# загрузка модели yolo
 model = YOLO(model_path)
 
 events = []
@@ -77,21 +92,14 @@ confirmed_occupied = None
 last_free_time = None
 possible_free_start = None
 
-#основной цикл обработки видео
-while True:
-    ok, frame = cap.read()
-    if not ok:
-        break
 
-    frame_index += 1
-    current_time_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-    if current_time_sec <= 0 and fps > 0:
-        current_time_sec = frame_index / fps
+def process_frame(frame, current_time_sec):
+    global confirmed_occupied, last_free_time, possible_free_start
 
     occupied = False
     people_count = 0
 
-    #получение детекций от модели для текущего кадра
+    # получение детекций от модели для текущего кадра
     results = model(frame, conf=conf_threshold, verbose=False)
 
     for box in results[0].boxes:
@@ -103,7 +111,7 @@ while True:
         person_box = clamp_box(coords, frame.shape[1], frame.shape[0])
         people_count += 1
 
-        #проверка пересечения рамки человека с зоной стола
+        # проверка пересечения рамки человека с зоной стола
         if intersects(person_box, table_box):
             occupied = True
 
@@ -158,7 +166,7 @@ while True:
             )
             last_free_time = None
 
-    #визуализация результатов на кадре
+    # визуализация результатов на кадре
     table_color = (0, 0, 255) if confirmed_occupied else (0, 255, 0)
     status_text = "occupied" if confirmed_occupied else "free"
 
@@ -207,19 +215,53 @@ while True:
             2,
         )
 
-    cv2.imshow("table status", frame)
+    return frame
 
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27 or key == ord("q"):
+
+# обрабатываем и сохраняем первый кадр тоже
+first_time_sec = frame_index / fps
+first_frame = process_frame(first_frame.copy(), first_time_sec)
+writer.write(first_frame)
+if show_preview:
+    cv2.imshow("table status", first_frame)
+
+# основной цикл обработки видео
+while True:
+    ok, frame = cap.read()
+    if not ok:
         break
 
+    frame_index += 1
+    current_time_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+    if current_time_sec <= 0:
+        current_time_sec = frame_index / fps
+
+    frame = process_frame(frame, current_time_sec)
+    writer.write(frame)
+    if show_preview:
+        cv2.imshow("table status", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27 or key == ord("q"):
+            break
+    elif frame_index % progress_step == 0:
+        if total_frames > 0:
+            progress_percent = frame_index / total_frames * 100
+            print(
+                f"processed {frame_index}/{total_frames} frames "
+                f"({progress_percent:.1f}%), time {current_time_sec:.2f}s"
+            )
+        else:
+            print(f"processed {frame_index} frames, time {current_time_sec:.2f}s")
+
 cap.release()
+writer.release()
 cv2.destroyAllWindows()
 
-#вывод результатов в виде таблиц
+# вывод результатов в виде таблиц
 events_df = pd.DataFrame(events)
 wait_times_df = pd.DataFrame(wait_times)
 
+print(f"\noutput video saved: {output_path}")
 print("\nсобытия по столику:")
 if events_df.empty:
     print("события не записаны")
